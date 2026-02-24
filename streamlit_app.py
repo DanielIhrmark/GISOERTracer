@@ -62,6 +62,11 @@ PHRASE_CATEGORIES: Dict[str, List[str]] = {
     ],
 }
 
+# ----------------------------
+# Regex for exact word counts without findall() lists  (CHANGE #2)
+# ----------------------------
+WORD_RE = re.compile(r"\b[\w']+\b")
+
 
 # ----------------------------
 # Utilities
@@ -180,12 +185,6 @@ def compile_phrase_regex(phrase: str) -> re.Pattern:
     return re.compile(r"(?i)\b" + joined + r"\b")
 
 
-def tokenize_word_count(text: str) -> int:
-    if not isinstance(text, str) or not text:
-        return 0
-    return len(re.findall(r"\b[\w']+\b", text))
-
-
 @dataclass
 class PhraseSpec:
     category: str
@@ -241,16 +240,17 @@ def load_master() -> Tuple[pd.DataFrame, Dict[int, str]]:
 
     master = base.merge(wide_sel, on=key, how="left")
 
-    # display title + snippet
+    # display title
     if "bib_title" in master.columns:
         master["title_display"] = master["bib_title"].fillna(master.get("file_name", ""))
     else:
         master["title_display"] = master.get("file_name", "")
-    master["text"] = master.get("text", "").astype(str)
-    master["text_snip"] = master["text"].str.slice(0, 350)
 
-    # word counts (cached)
-    master["word_count"] = master["text"].apply(tokenize_word_count).astype(int)
+    # ensure text is str
+    master["text"] = master.get("text", "").astype(str)
+
+    # exact word counts WITHOUT findall() (CHANGE #2)
+    master["word_count"] = master["text"].str.count(WORD_RE).astype("int64")
 
     # types
     master["wide_topic"] = pd.to_numeric(master["wide_topic"], errors="coerce").astype("Int64")
@@ -278,6 +278,9 @@ def compute_phrase_counts_by_year(df: pd.DataFrame, specs: List[PhraseSpec]) -> 
     """
     Returns:
       year, phrase, category, hits, total_words, per_1000
+
+    CHANGE #2: use vectorized Series.str.count() instead of regex.findall()
+    to avoid allocating match lists (large memory spikes).
     """
     work = df.dropna(subset=["year"]).copy()
     work = work[work["year"].notna()].copy()
@@ -288,25 +291,27 @@ def compute_phrase_counts_by_year(df: pd.DataFrame, specs: List[PhraseSpec]) -> 
 
     totals = work.groupby("year")["word_count"].sum().reset_index(name="total_words")
 
-    rows = []
-    texts = work["text"].tolist()
-    years = work["year"].tolist()
-
-    year_to_idx: Dict[int, List[int]] = {}
-    for i, y in enumerate(years):
-        year_to_idx.setdefault(y, []).append(i)
+    frames = []
+    text_series = work["text"].astype(str)
 
     for spec in specs:
-        doc_hits = [len(spec.regex.findall(t)) for t in texts]
-        for y, idxs in year_to_idx.items():
-            hits = int(sum(doc_hits[i] for i in idxs))
-            rows.append({"year": y, "phrase": spec.phrase, "category": spec.category, "hits": hits})
+        hits_by_year = (
+            text_series.str.count(spec.regex)
+            .groupby(work["year"])
+            .sum()
+            .reset_index(name="hits")
+        )
+        hits_by_year["phrase"] = spec.phrase
+        hits_by_year["category"] = spec.category
+        frames.append(hits_by_year)
 
-    out = pd.DataFrame(rows)
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["year", "hits", "phrase", "category"]
+    )
     out = out.merge(totals, on="year", how="left")
     out["per_1000"] = (out["hits"] / out["total_words"].replace(0, np.nan)) * 1000.0
     out["per_1000"] = out["per_1000"].fillna(0.0)
-    return out
+    return out[["year", "phrase", "category", "hits", "total_words", "per_1000"]]
 
 
 def compute_topic_share_by_year(df: pd.DataFrame) -> pd.DataFrame:
@@ -405,13 +410,17 @@ with st.sidebar:
     show_doc_stats = st.checkbox("Show document stats table", value=False)
 
 # Apply filters
-df = master.copy()
+df = master  # CHANGE #1: avoid duplicating full text dataframe in memory
+
 df = df[(df["year"].isna()) | ((df["year"] >= year_range[0]) & (df["year"] <= year_range[1]))]
 
 if selected_journals and "journal_name" in df.columns:
     df = df[df["journal_name"].isin(selected_journals)]
 
 df = filter_by_concepts(df, selected_concepts, mode_any=concept_any)
+
+# Keep this copy (smallish) because downstream may add columns / subset;
+# it does NOT duplicate 'master' anymore (we removed master.copy()).
 df_for_freq = df[df["word_count"] > 0].copy()
 
 # Prepare phrase specs (built-in + custom)
@@ -591,9 +600,13 @@ st.divider()
 
 if show_doc_stats:
     st.subheader("Document-level table (filtered)")
+    # Compute snippet ONLY when needed (avoids keeping a second big string column resident)
+    df_view = df.copy()
+    df_view["text_snip"] = df_view["text"].str.slice(0, 350)
+
     cols = [
         "year", "journal_name", "journal_issue", "title_display", "file_name",
         "wide_topic", "wide_prob", "concept_names_str", "word_count", "text_snip", "pdf_path"
     ]
-    cols = [c for c in cols if c in df.columns]
-    st.dataframe(df[cols], use_container_width=True, hide_index=True)
+    cols = [c for c in cols if c in df_view.columns]
+    st.dataframe(df_view[cols], use_container_width=True, hide_index=True)
